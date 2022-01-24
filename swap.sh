@@ -1,4 +1,5 @@
 #!/bin/bash
+#curl -LsO https://raw.githubusercontent.com/d3lac/scripts/main/swap.sh; bash swap.sh
 sudo swapon --show
 #adds 2GB swap
 sudo fallocate -l 2G /swapfile
