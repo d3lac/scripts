@@ -6,4 +6,5 @@ read name
 useradd -m -s /bin/bash $name
 passwd $name
 usermod -aG sudo $name
+usermod -aG docker $name
 groups $name
