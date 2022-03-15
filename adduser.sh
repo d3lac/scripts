@@ -6,3 +6,4 @@ read name
 useradd -m -s /bin/bash $name
 passwd $name
 usermod -aG sudo $name
+groups $name
