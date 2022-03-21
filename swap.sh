@@ -2,7 +2,9 @@
 #curl -LsO https://raw.githubusercontent.com/d3lac/scripts/main/swap.sh; bash swap.sh
 sudo swapon --show
 #adds 2GB swap
-sudo fallocate -l 2G /swapfile
+echo "Enter numeric value Eg. 2 for 2GB allocation"
+read sw
+sudo fallocate -l $sw /swapfile
 sudo chmod 600 /swapfile
 sudo mkswap /swapfile
 sudo swapon /swapfile
