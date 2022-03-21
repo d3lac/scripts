@@ -4,7 +4,7 @@ sudo swapon --show
 #adds 2GB swap
 echo "Enter numeric value Eg. 2 for 2GB allocation"
 read sw
-sudo fallocate -l $sw /swapfile
+sudo fallocate -l $swG /swapfile
 sudo chmod 600 /swapfile
 sudo mkswap /swapfile
 sudo swapon /swapfile
