@@ -7,4 +7,4 @@ sudo chmod 755 $DESTINATION
 sudo systemctl enable docker
 sudo systemctl start docker
 sudo docker version
-sudo docker compose version
+sudo docker compose --version
