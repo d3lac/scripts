@@ -1,3 +1,4 @@
+#curl -LsO https://raw.githubusercontent.com/d3lac/scripts/main/fresh-install.sh; bash fresh-install.sh
 #Created by Gemini AI
 
 #!/usr/bin/env bash
