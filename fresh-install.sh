@@ -1,3 +1,5 @@
+#Created by Gemini AI
+
 #!/usr/bin/env bash
 set -euo pipefail
 
