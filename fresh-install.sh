@@ -1,25 +1,30 @@
-#Written by Gemini AI
 #!/usr/bin/env bash
 set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
 
 CONFIG_FILE="/etc/ssh/sshd_config"
-BACKUP_FILE="/etc/ssh/sshd_config.bak.$(date +%Y%m%d_%H%M%S)"
+BACKUP_DIR="/root/ssh_backup_$(date +%Y%m%d_%H%M%S)"
 SWAP_FILE="/swapfile"
+APT_OPTS=(-y -q -o DPkg::Lock::Timeout=60 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold")
 
 # ==============================================================================
-# STEP 0: Pre-flight Root Check
+# STEP 0: Pre-flight Root & Environment Check
 # ==============================================================================
 if [[ $EUID -ne 0 ]]; then
     echo "[ERROR] This script must be run as root (use sudo)." >&2
     exit 1
 fi
 
+if ! command -v sshd &>/dev/null; then
+    echo "[ERROR] OpenSSH server (sshd) is not installed." >&2
+    exit 1
+fi
+
 # ==============================================================================
-# STEP 1: Collect & Validate All Interactive Inputs Up Front
+# STEP 1: Complete All Interactive User Prompts Up Front
 # ==============================================================================
-echo "=== 1/6: Interactive Setup Prompts ==="
+echo "=== 1/7: Interactive Configuration ==="
 
 # 1a. Target Username
 DEFAULT_USER="${SUDO_USER:-}"
@@ -40,13 +45,19 @@ if ! [[ "$TARGET_USER" =~ ^[a-z_][a-z0-9_-]*[$]?$ ]]; then
     exit 1
 fi
 
-USER_EXISTS=false
 if id "$TARGET_USER" &>/dev/null; then
     if [[ "$(id -u "$TARGET_USER")" -eq 0 ]]; then
         echo "[ERROR] User '$TARGET_USER' has UID 0 (root). Aborting." >&2
         exit 1
     fi
-    USER_EXISTS=true
+    echo "[OK] User '$TARGET_USER' already exists."
+else
+    useradd -m -s /bin/bash "$TARGET_USER"
+    echo "[OK] Created user '$TARGET_USER'."
+    echo "Set a password for '$TARGET_USER' (required for sudo commands):"
+    until passwd "$TARGET_USER"; do
+        echo "[WARNING] Password setup failed. Please try again."
+    done
 fi
 
 # 1b. SSH Public Key
@@ -81,25 +92,23 @@ if [[ "$SWAP_GB" != "0" ]]; then
     fi
 fi
 
-# ==============================================================================
-# STEP 2: Create User, Grant Sudo & Install SSH Key
-# ==============================================================================
-echo "=== 2/6: Configuring User, Sudo & SSH Keys ==="
-
-if [[ "$USER_EXISTS" = true ]]; then
-    echo "[OK] User '$TARGET_USER' already exists."
-else
-    useradd -m -s /bin/bash "$TARGET_USER"
-    echo "[OK] Created user '$TARGET_USER'."
-    echo "Set a password for '$TARGET_USER' (required for sudo commands):"
-    until passwd "$TARGET_USER"; do
-        echo "[WARNING] Password setup failed. Please try again."
-    done
+# 1d. Docker Installation
+read -rp "Install Docker Engine and Docker Compose? [y/N]: " INSTALL_DOCKER_INPUT
+INSTALL_DOCKER=false
+if [[ "${INSTALL_DOCKER_INPUT,,}" =~ ^(y|yes)$ ]]; then
+    INSTALL_DOCKER=true
 fi
 
+echo "=== All prompts complete. Running unattended setup... ==="
+
+# ==============================================================================
+# STEP 2: Configure Sudo & SSH Public Key (With Lockout Protection)
+# ==============================================================================
+echo "=== 2/7: Configuring Sudo & SSH Keys ==="
+
 if ! command -v sudo &>/dev/null; then
-    apt-get update -q
-    apt-get install -y -q sudo
+    apt-get update -q -o DPkg::Lock::Timeout=60
+    apt-get install "${APT_OPTS[@]}" sudo
 fi
 
 usermod -aG sudo "$TARGET_USER"
@@ -123,7 +132,7 @@ if [[ -n "$USER_PUB_KEY" ]]; then
     chmod 600 "$AUTH_KEYS"
 fi
 
-# Lockout guard: verify at least one non-root user has a non-empty authorized_keys file
+# Verify at least one non-root user has a valid authorized_keys file
 KEY_FOUND=false
 while IFS=: read -r username _ uid _ _ homedir _; do
     if [[ "$uid" -ge 1000 && "$username" != "nobody" && -s "$homedir/.ssh/authorized_keys" ]]; then
@@ -142,18 +151,22 @@ fi
 # ==============================================================================
 # STEP 3: Allocate & Enable Swap (Before Heavy APT Operations)
 # ==============================================================================
-echo "=== 3/6: Configuring Swap Memory ==="
+echo "=== 3/7: Configuring Swap Memory ==="
 
 if [[ "$SWAP_GB" != "0" ]]; then
     if [[ -e "$SWAP_FILE" ]]; then
         echo "[WARNING] $SWAP_FILE already exists. Skipping swap creation." >&2
     else
         echo "[INFO] Allocating ${SWAP_GB}GB swap file at $SWAP_FILE..."
-        if ! fallocate -l "${SWAP_GB}G" "$SWAP_FILE" 2>/dev/null; then
-            dd if=/dev/zero of="$SWAP_FILE" bs=1M count=$((SWAP_GB * 1024)) status=progress
+        FS_TYPE=$(df -T / | awk 'NR==2 {print $2}')
+        if [[ "$FS_TYPE" == "ext4" || "$FS_TYPE" == "xfs" ]] && fallocate -l "${SWAP_GB}G" "$SWAP_FILE" 2>/dev/null; then
+            true
+        else
+            dd if=/dev/zero of="$SWAP_FILE" bs=1M count=$((SWAP_GB * 1024)) status=none
         fi
+
         chmod 600 "$SWAP_FILE"
-        mkswap "$SWAP_FILE"
+        mkswap -q "$SWAP_FILE"
         swapon "$SWAP_FILE"
 
         if ! grep -Fq "$SWAP_FILE" /etc/fstab; then
@@ -169,37 +182,79 @@ else
 fi
 
 # ==============================================================================
-# STEP 4: System Update & Cleanup
+# STEP 4: System Update, Cleanup & Unattended Upgrades
 # ==============================================================================
-echo "=== 4/6: Updating System Packages ==="
-apt-get update -q
-apt-get upgrade -y -q \
-    -o Dpkg::Options::="--force-confdef" \
-    -o Dpkg::Options::="--force-confold"
-apt-get autoremove -y -q
+echo "=== 4/7: Updating System & Enabling Unattended Upgrades ==="
+apt-get update -q -o DPkg::Lock::Timeout=60
+apt-get upgrade "${APT_OPTS[@]}"
+apt-get install "${APT_OPTS[@]}" unattended-upgrades apt-listchanges curl ca-certificates
+apt-get autoremove "${APT_OPTS[@]}"
 apt-get autoclean -y -q
-echo "[OK] System updated and cleaned."
 
-# ==============================================================================
-# STEP 5: Configure Unattended Upgrades
-# ==============================================================================
-echo "=== 5/6: Enabling Unattended Security Upgrades ==="
-apt-get install -y -q unattended-upgrades apt-listchanges
 echo "unattended-upgrades unattended-upgrades/enable_auto_updates boolean true" | debconf-set-selections
 dpkg-reconfigure -f noninteractive unattended-upgrades
-echo "[OK] Automatic security updates enabled."
+echo "[OK] System updated and automatic security upgrades enabled."
 
 # ==============================================================================
-# STEP 6: Backup, Harden & Reload SSH
+# STEP 5: Install Docker Engine & Docker Compose (Optional)
 # ==============================================================================
-echo "=== 6/6: Hardening SSH Configuration ==="
-if [[ -f "$CONFIG_FILE" ]]; then
-    cp -p "$CONFIG_FILE" "$BACKUP_FILE"
-    echo "[OK] Backup saved to $BACKUP_FILE"
+echo "=== 5/7: Docker Installation ==="
+
+if [[ "$INSTALL_DOCKER" = true ]]; then
+    if command -v docker &>/dev/null; then
+        echo "[OK] Docker is already installed: $(docker --version)"
+    else
+        echo "[INFO] Downloading and running Docker convenience script..."
+        curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+        sh /tmp/get-docker.sh
+        rm -f /tmp/get-docker.sh
+
+        systemctl enable --now docker
+        echo "[OK] Docker installed and started: $(docker --version)"
+    fi
+
+    usermod -aG docker "$TARGET_USER"
+    echo "[OK] Added '$TARGET_USER' to the 'docker' group."
+    echo "[OK] Compose version: $(docker compose version)"
 else
-    echo "[ERROR] $CONFIG_FILE not found." >&2
-    exit 1
+    echo "[OK] Docker installation skipped."
 fi
+
+# ==============================================================================
+# STEP 6: Enable TCP BBR Congestion Control
+# ==============================================================================
+echo "=== 6/7: Configuring TCP BBR ==="
+modprobe tcp_bbr 2>/dev/null || true
+
+if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+    cat << 'EOF' > /etc/sysctl.d/99-bbr.conf
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+    sysctl -q --system
+
+    if [[ "$(sysctl -n net.ipv4.tcp_congestion_control)" == "bbr" ]]; then
+        echo "[OK] TCP BBR congestion control enabled and persisted."
+    else
+        echo "[WARNING] BBR config written, but active algorithm is $(sysctl -n net.ipv4.tcp_congestion_control)." >&2
+    fi
+else
+    echo "[WARNING] TCP BBR is not available in the running kernel. Skipping." >&2
+fi
+
+# ==============================================================================
+# STEP 7: Backup, Harden & Reload SSH
+# ==============================================================================
+echo "=== 7/7: Hardening SSH Configuration ==="
+mkdir -p "$BACKUP_DIR"
+cp -p "$CONFIG_FILE" "$BACKUP_DIR/sshd_config"
+if [[ -d /etc/ssh/sshd_config.d ]]; then
+    cp -rp /etc/ssh/sshd_config.d "$BACKUP_DIR/"
+    # Neutralize cloud-init or vendor drop-in overrides that re-enable password/root login
+    find /etc/ssh/sshd_config.d -type f -name '*.conf' -exec \
+        sed -i -E 's/^\s*(PasswordAuthentication|PermitRootLogin|KbdInteractiveAuthentication)\s+yes/# [Disabled by setup_debian.sh] &/I' {} +
+fi
+echo "[OK] Existing SSH configs backed up to $BACKUP_DIR"
 
 cat << 'EOF' > "$CONFIG_FILE"
 Include /etc/ssh/sshd_config.d/*.conf
@@ -230,14 +285,10 @@ EOF
 
 chmod 644 "$CONFIG_FILE"
 
-if grep -rnE '^\s*(PasswordAuthentication|PermitRootLogin)\s+yes' /etc/ssh/sshd_config.d/ 2>/dev/null; then
-    echo "[WARNING] A drop-in file in /etc/ssh/sshd_config.d/ sets PasswordAuthentication or PermitRootLogin to 'yes'." >&2
-    echo "          Because 'Include' is at the top of sshd_config, that drop-in file will override your settings." >&2
-fi
-
 if ! sshd -t; then
     echo "[ERROR] SSH syntax validation failed! Restoring backup..." >&2
-    cp -p "$BACKUP_FILE" "$CONFIG_FILE"
+    cp -p "$BACKUP_DIR/sshd_config" "$CONFIG_FILE"
+    [[ -d "$BACKUP_DIR/sshd_config.d" ]] && cp -rp "$BACKUP_DIR/sshd_config.d/." /etc/ssh/sshd_config.d/
     exit 1
 fi
 echo "[OK] SSH syntax validation passed."
@@ -253,8 +304,10 @@ else
     exit 1
 fi
 
-echo "=== Setup Complete ==="
+echo "=========================================="
+echo "=== Server Setup Complete ==="
+echo "=========================================="
 if [[ -f /var/run/reboot-required ]]; then
-    echo "[NOTICE] A reboot is required to finish kernel/system updates."
-    echo "         Verify SSH key login as '$TARGET_USER' in a NEW terminal before running 'sudo reboot'."
+    echo "[NOTICE] A system reboot is required to finish applying kernel/system updates."
+    echo "         Test SSH key login as '$TARGET_USER' in a NEW terminal before running 'sudo reboot'."
 fi
